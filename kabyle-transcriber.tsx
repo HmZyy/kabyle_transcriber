@@ -37,6 +37,9 @@ import {
   CheckCircle,
   Clock,
   Volume2,
+  Upload,
+  File,
+  FileAudio,
 } from "lucide-react";
 
 interface TranscriptionMessage {
@@ -55,6 +58,15 @@ interface Transcription {
   timestamp: Date;
   audioId: string;
   isLive: boolean;
+  source: "recording" | "upload";
+  fileName?: string;
+}
+
+interface UploadStatus {
+  isUploading: boolean;
+  progress: number;
+  fileName: string;
+  error?: string;
 }
 
 export default function KabyleTranscriber() {
@@ -74,15 +86,22 @@ export default function KabyleTranscriber() {
   const [permissionGranted, setPermissionGranted] = useState(false);
   const [audioInitialized, setAudioInitialized] = useState(false);
 
+  // File upload state
+  const [uploadStatus, setUploadStatus] = useState<UploadStatus>({
+    isUploading: false,
+    progress: 0,
+    fileName: "",
+  });
+
   // Settings - Load from localStorage
   const [wsUrl, setWsUrl] = useState(() => {
     if (typeof window !== "undefined") {
       return (
         localStorage.getItem("kabyle-transcriber-ws-url") ||
-        "ws://localhost:8765"
+        "ws://localhost:16391"
       );
     }
-    return "ws://localhost:8765";
+    return "ws://localhost:16391";
   });
 
   const [chunkDuration, setChunkDuration] = useState(() => {
@@ -119,6 +138,7 @@ export default function KabyleTranscriber() {
   const chunkCounterRef = useRef(0);
   const wsRef = useRef<WebSocket | null>(null);
   const touchStartTimeRef = useRef<number>(0);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Detect mobile device
   useEffect(() => {
@@ -132,7 +152,6 @@ export default function KabyleTranscriber() {
       setIsMobile(isMobileDevice);
       addLog(`Device detected: ${isMobileDevice ? "Mobile" : "Desktop"}`);
     };
-
     checkMobile();
   }, []);
 
@@ -239,21 +258,280 @@ export default function KabyleTranscriber() {
           timestamp: new Date(data.timestamp || Date.now()),
           audioId: data.audio_id || "unknown",
           isLive: true,
+          source: data.audio_id?.includes("upload") ? "upload" : "recording",
+          fileName: data.audio_id?.includes("upload")
+            ? uploadStatus.fileName
+            : undefined,
         };
-
         setTranscriptions((prev) => [...prev.slice(-19), newTranscription]);
         addLog(`Live transcription: ${data.transcription}`);
+
+        // Clear upload status if this was an upload
+        if (data.audio_id?.includes("upload")) {
+          setUploadStatus({
+            isUploading: false,
+            progress: 0,
+            fileName: "",
+          });
+        }
+      } else if (type === "upload_progress") {
+        // Handle server-side upload progress updates
+        if (data.message) {
+          addLog(`Server: ${data.message}`);
+        }
+      } else if (type === "upload_complete") {
+        // Handle upload completion confirmation from server
+        addLog(
+          `Server confirmed upload completion: ${data.message || "Upload processed successfully"}`,
+        );
+        setUploadStatus({
+          isUploading: false,
+          progress: 100,
+          fileName: "",
+        });
       } else if (type === "error") {
         addLog(`Error: ${data.message} (${data.code || "unknown"})`);
         if (!isRecording) {
           setConnectionStatus("error");
           setConnectionMessage(data.message || "Unknown error");
         }
+        // Clear upload status on error
+        if (uploadStatus.isUploading) {
+          setUploadStatus({
+            isUploading: false,
+            progress: 0,
+            fileName: "",
+            error: data.message || "Upload failed",
+          });
+        }
       } else {
         addLog(`Unknown message type: ${type}`);
       }
     },
-    [addLog, isRecording],
+    [addLog, isRecording, uploadStatus.fileName, uploadStatus.isUploading],
+  );
+
+  // File upload handler with chunking support
+  const handleFileUpload = useCallback(
+    async (file: File) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        addLog("Cannot upload file: WebSocket not connected");
+        return;
+      }
+
+      // Validate file type
+      const allowedTypes = ["audio/wav", "audio/mpeg", "audio/mp3"];
+      const fileExtension = file.name.toLowerCase().split(".").pop();
+      const isValidExtension = ["wav", "mp3"].includes(fileExtension || "");
+      const isValidMimeType = allowedTypes.includes(file.type);
+
+      if (!isValidExtension && !isValidMimeType) {
+        addLog(
+          `Invalid file type: ${file.type || "unknown"}. Only .wav and .mp3 files are supported.`,
+        );
+        setUploadStatus({
+          isUploading: false,
+          progress: 0,
+          fileName: "",
+          error: "Invalid file type. Only .wav and .mp3 files are supported.",
+        });
+        return;
+      }
+
+      // Check file size (limit to 100MB for chunked upload)
+      const maxSize = 100 * 1024 * 1024; // 100MB
+      if (file.size > maxSize) {
+        addLog(
+          `File too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Maximum size is 100MB.`,
+        );
+        setUploadStatus({
+          isUploading: false,
+          progress: 0,
+          fileName: "",
+          error: "File too large. Maximum size is 100MB.",
+        });
+        return;
+      }
+
+      setUploadStatus({
+        isUploading: true,
+        progress: 0,
+        fileName: file.name,
+      });
+
+      addLog(
+        `Starting chunked upload: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)}MB)`,
+      );
+
+      try {
+        // Calculate chunk size (aim for ~512KB chunks to stay well under 1MB limit)
+        const CHUNK_SIZE = 512 * 1024; // 512KB
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        const uploadId = `upload_${Date.now()}_${file.name.replace(/[^a-zA-Z0-9]/g, "_")}`;
+
+        addLog(
+          `File will be split into ${totalChunks} chunks of ~${(CHUNK_SIZE / 1024).toFixed(0)}KB each`,
+        );
+
+        // Send upload start message
+        const startMessage = {
+          type: "upload_start",
+          upload_id: uploadId,
+          file_name: file.name,
+          file_size: file.size,
+          total_chunks: totalChunks,
+          chunk_size: CHUNK_SIZE,
+          timestamp: new Date().toISOString(),
+        };
+
+        if (wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify(startMessage));
+          addLog(`Sent upload start message for ${totalChunks} chunks`);
+        } else {
+          throw new Error("WebSocket connection lost before upload start");
+        }
+
+        // Process file in chunks
+        for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+          // Check if WebSocket is still connected
+          if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            throw new Error("WebSocket connection lost during upload");
+          }
+
+          const start = chunkIndex * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, file.size);
+          const chunk = file.slice(start, end);
+
+          // Convert chunk to base64
+          const chunkBase64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = (event) => {
+              const result = event.target?.result as string;
+              if (!result) {
+                reject(new Error("Failed to read chunk data"));
+                return;
+              }
+              const base64Data = result.split(",")[1];
+              if (!base64Data) {
+                reject(new Error("Invalid chunk data format"));
+                return;
+              }
+              resolve(base64Data);
+            };
+            reader.onerror = () => reject(new Error("Failed to read chunk"));
+            reader.readAsDataURL(chunk);
+          });
+
+          // Send chunk
+          const chunkMessage = {
+            type: "upload_chunk",
+            upload_id: uploadId,
+            chunk_index: chunkIndex,
+            total_chunks: totalChunks,
+            chunk_data: chunkBase64,
+            chunk_size: chunk.size,
+            is_final_chunk: chunkIndex === totalChunks - 1,
+            timestamp: new Date().toISOString(),
+          };
+
+          wsRef.current.send(JSON.stringify(chunkMessage));
+
+          // Update progress
+          const progress = Math.round(((chunkIndex + 1) / totalChunks) * 100);
+          setUploadStatus((prev) => ({
+            ...prev,
+            progress: progress,
+          }));
+
+          addLog(
+            `Sent chunk ${chunkIndex + 1}/${totalChunks} (${(chunk.size / 1024).toFixed(1)}KB) - ${progress}%`,
+          );
+
+          // Small delay to prevent overwhelming the server
+          if (chunkIndex < totalChunks - 1) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        }
+
+        // Send upload complete message
+        const completeMessage = {
+          type: "upload_complete",
+          upload_id: uploadId,
+          file_name: file.name,
+          file_size: file.size,
+          total_chunks: totalChunks,
+          timestamp: new Date().toISOString(),
+        };
+
+        if (wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify(completeMessage));
+          addLog(`Upload completed successfully: ${file.name}`);
+        } else {
+          throw new Error("WebSocket connection lost during upload completion");
+        }
+      } catch (error) {
+        addLog("Error uploading file: " + (error as Error).message);
+        setUploadStatus({
+          isUploading: false,
+          progress: 0,
+          fileName: "",
+          error: (error as Error).message,
+        });
+
+        // Send upload error message to server if still connected
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          try {
+            const errorMessage = {
+              type: "upload_error",
+              upload_id: `upload_${Date.now()}_${file.name.replace(/[^a-zA-Z0-9]/g, "_")}`,
+              error: (error as Error).message,
+              timestamp: new Date().toISOString(),
+            };
+            wsRef.current.send(JSON.stringify(errorMessage));
+          } catch (sendError) {
+            addLog(
+              "Failed to send error message to server: " +
+                (sendError as Error).message,
+            );
+          }
+        }
+      }
+    },
+    [addLog],
+  );
+
+  // Handle file input change
+  const handleFileInputChange = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      if (file) {
+        handleFileUpload(file);
+      }
+      // Reset the input so the same file can be selected again
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    },
+    [handleFileUpload],
+  );
+
+  // Handle drag and drop
+  const handleDrop = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      const file = event.dataTransfer.files?.[0];
+      if (file) {
+        handleFileUpload(file);
+      }
+    },
+    [handleFileUpload],
+  );
+
+  const handleDragOver = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+    },
+    [],
   );
 
   // Initialize audio with comprehensive mobile support
@@ -462,7 +740,6 @@ export default function KabyleTranscriber() {
   // Improved audio level monitoring
   const updateAudioLevel = useCallback(() => {
     const actuallyRecording = mediaRecorderRef.current?.state === "recording";
-
     if (!analyserRef.current || !actuallyRecording) {
       if (audioLevelAnimationRef.current) {
         cancelAnimationFrame(audioLevelAnimationRef.current);
@@ -485,7 +762,6 @@ export default function KabyleTranscriber() {
         const sample = (dataArray[i] - 128) / 128; // Normalize to -1 to 1
         sum += sample * sample;
       }
-
       const rms = Math.sqrt(sum / bufferLength);
       const level = Math.min(100, rms * 100 * 5); // Amplify for better visibility
 
@@ -661,7 +937,6 @@ export default function KabyleTranscriber() {
       const backupLevelUpdater = setInterval(() => {
         const actuallyRecording =
           mediaRecorderRef.current?.state === "recording";
-
         if (!actuallyRecording) {
           return;
         }
@@ -670,6 +945,7 @@ export default function KabyleTranscriber() {
           try {
             const dataArray = new Uint8Array(analyserRef.current.fftSize);
             analyserRef.current.getByteTimeDomainData(dataArray);
+
             // Simple average calculation
             let sum = 0;
             for (let i = 0; i < dataArray.length; i++) {
@@ -862,7 +1138,6 @@ export default function KabyleTranscriber() {
     (e: React.MouseEvent | React.TouchEvent) => {
       e.preventDefault();
       e.stopPropagation();
-
       setIsPressed(false);
 
       if (isRecording) {
@@ -986,7 +1261,6 @@ export default function KabyleTranscriber() {
               Kabyle Transcriber
             </h1>
           </div>
-
           <div className="flex flex-wrap items-center justify-center gap-2">
             <Badge variant="default" className="flex items-center gap-1">
               {getConnectionStatusIcon()}
@@ -998,14 +1272,12 @@ export default function KabyleTranscriber() {
                     ? "Error"
                     : "Disconnected"}
             </Badge>
-
             {isMobile && (
               <Badge variant="secondary" className="flex items-center gap-1">
                 <Smartphone className="h-3 w-3" />
                 Mobile
               </Badge>
             )}
-
             {connectionMessage && (
               <p className="text-sm text-slate-400">{connectionMessage}</p>
             )}
@@ -1026,6 +1298,98 @@ export default function KabyleTranscriber() {
           </TabsList>
 
           <TabsContent value="main" className="space-y-6">
+            {/* File Upload Section */}
+            <Card className="bg-slate-800 border-slate-700">
+              <CardHeader>
+                <CardTitle className="text-center text-slate-100 flex items-center justify-center gap-2">
+                  <Upload className="h-5 w-5" />
+                  Upload Audio File
+                </CardTitle>
+                <CardDescription className="text-center text-slate-400">
+                  Upload .wav or .mp3 files for transcription
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div
+                  className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
+                    connectionStatus === "connected"
+                      ? "border-slate-600 hover:border-slate-500 hover:bg-slate-700/50"
+                      : "border-slate-700 opacity-50"
+                  }`}
+                  onDrop={handleDrop}
+                  onDragOver={handleDragOver}
+                >
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".wav,.mp3,audio/wav,audio/mpeg,audio/mp3"
+                    onChange={handleFileInputChange}
+                    className="hidden"
+                    disabled={
+                      connectionStatus !== "connected" ||
+                      uploadStatus.isUploading
+                    }
+                  />
+
+                  {uploadStatus.isUploading ? (
+                    <div className="space-y-4">
+                      <FileAudio className="h-12 w-12 mx-auto text-blue-500 animate-pulse" />
+                      <div>
+                        <p className="text-slate-200 font-medium">
+                          Uploading {uploadStatus.fileName}...
+                        </p>
+                        <Progress
+                          value={uploadStatus.progress}
+                          className="mt-2"
+                        />
+                        <p className="text-sm text-slate-400 mt-1">
+                          {uploadStatus.progress}% complete
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      <FileAudio className="h-12 w-12 mx-auto text-slate-400" />
+                      <div>
+                        <p className="text-slate-200 font-medium">
+                          Drop audio files here or click to browse
+                        </p>
+                        <p className="text-sm text-slate-400 mt-1">
+                          Supports .wav and .mp3 files up to 100MB
+                        </p>
+                      </div>
+                      <Button
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={connectionStatus !== "connected"}
+                        className="bg-blue-600 hover:bg-blue-700"
+                      >
+                        <Upload className="h-4 w-4 mr-2" />
+                        Choose File
+                      </Button>
+                    </div>
+                  )}
+                </div>
+
+                {uploadStatus.error && (
+                  <Alert className="bg-red-900/20 border-red-800">
+                    <AlertCircle className="h-4 w-4 text-red-500" />
+                    <AlertDescription className="text-red-200">
+                      {uploadStatus.error}
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                {connectionStatus !== "connected" && (
+                  <Alert className="bg-yellow-900/20 border-yellow-800">
+                    <AlertCircle className="h-4 w-4 text-yellow-500" />
+                    <AlertDescription className="text-yellow-200">
+                      Connect to server to upload files
+                    </AlertDescription>
+                  </Alert>
+                )}
+              </CardContent>
+            </Card>
+
             {/* Recording Controls */}
             <Card className="bg-slate-800 border-slate-700">
               <CardHeader>
@@ -1091,7 +1455,6 @@ export default function KabyleTranscriber() {
                       </div>
                       <p className="text-sm text-slate-400">Recording time</p>
                     </div>
-
                     <div className="space-y-2">
                       <div className="flex items-center justify-center gap-2">
                         <Volume2 className="h-4 w-4 text-slate-400" />
@@ -1130,7 +1493,8 @@ export default function KabyleTranscriber() {
                       <Mic className="h-12 w-12 mb-4 opacity-50" />
                       <p>No transcriptions yet.</p>
                       <p className="text-sm">
-                        {isMobile ? "Tap and hold" : "Hold"} the microphone
+                        Upload an audio file or{" "}
+                        {isMobile ? "tap and hold" : "hold"} the microphone
                         button to record.
                       </p>
                     </div>
@@ -1140,36 +1504,53 @@ export default function KabyleTranscriber() {
                         <div
                           key={transcription.id}
                           className={`p-4 rounded-lg border-l-4 bg-slate-700/50 ${
-                            transcription.isLive
-                              ? "border-l-yellow-500"
-                              : "border-l-blue-500"
+                            transcription.source === "upload"
+                              ? "border-l-green-500"
+                              : transcription.isLive
+                                ? "border-l-yellow-500"
+                                : "border-l-blue-500"
                           }`}
                         >
                           <div className="flex items-center justify-between mb-2">
-                            <Badge
-                              variant={
-                                transcription.isLive ? "destructive" : "default"
-                              }
-                              className="text-xs"
-                            >
-                              {transcription.isLive ? (
-                                <>
-                                  <Activity className="h-3 w-3 mr-1" />
-                                  Live
-                                </>
-                              ) : (
-                                <>
-                                  <CheckCircle className="h-3 w-3 mr-1" />
-                                  Final
-                                </>
+                            <div className="flex items-center gap-2">
+                              <Badge
+                                variant={
+                                  transcription.source === "upload"
+                                    ? "default"
+                                    : transcription.isLive
+                                      ? "destructive"
+                                      : "default"
+                                }
+                                className="text-xs"
+                              >
+                                {transcription.source === "upload" ? (
+                                  <>
+                                    <File className="h-3 w-3 mr-1" />
+                                    Upload
+                                  </>
+                                ) : transcription.isLive ? (
+                                  <>
+                                    <Activity className="h-3 w-3 mr-1" />
+                                    Live
+                                  </>
+                                ) : (
+                                  <>
+                                    <CheckCircle className="h-3 w-3 mr-1" />
+                                    Final
+                                  </>
+                                )}
+                              </Badge>
+                              {transcription.fileName && (
+                                <Badge variant="outline" className="text-xs">
+                                  {transcription.fileName}
+                                </Badge>
                               )}
-                            </Badge>
+                            </div>
                             <span className="text-xs text-slate-400 flex items-center gap-1">
                               <Clock className="h-3 w-3" />
                               {transcription.timestamp.toLocaleString()}
                             </span>
                           </div>
-
                           <p className="text-sm md:text-base leading-relaxed text-slate-200">
                             {transcription.text || (
                               <em className="text-slate-400">
@@ -1177,7 +1558,6 @@ export default function KabyleTranscriber() {
                               </em>
                             )}
                           </p>
-
                           <div className="text-xs text-slate-500 mt-2 truncate">
                             Audio ID: {transcription.audioId}
                           </div>
@@ -1208,12 +1588,11 @@ export default function KabyleTranscriber() {
                     type="text"
                     value={wsUrl}
                     onChange={(e) => setWsUrl(e.target.value)}
-                    placeholder="ws://localhost:8765"
+                    placeholder="ws://localhost:16391"
                     disabled={connectionStatus === "connecting"}
                     className="bg-slate-700 border-slate-600 text-slate-100 placeholder:text-slate-400"
                   />
                 </div>
-
                 <div className="flex flex-col sm:flex-row gap-2">
                   {connectionStatus === "connected" ? (
                     <Button
@@ -1236,7 +1615,6 @@ export default function KabyleTranscriber() {
                         : "Connect"}
                     </Button>
                   )}
-
                   <Button
                     variant="outline"
                     onClick={() => {
@@ -1289,7 +1667,6 @@ export default function KabyleTranscriber() {
                       className="bg-slate-700 border-slate-600 text-slate-100"
                     />
                   </div>
-
                   <div className="space-y-2">
                     <Label htmlFor="audio-quality" className="text-slate-200">
                       Audio Quality

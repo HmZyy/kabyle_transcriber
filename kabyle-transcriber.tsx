@@ -1303,6 +1303,88 @@ export default function KabyleTranscriber() {
           </TabsList>
 
           <TabsContent value="main" className="space-y-6">
+            {/* Recording Controls */}
+            <Card className="bg-slate-800 border-slate-700">
+              <CardHeader>
+                <CardTitle className="text-center text-slate-100">
+                  Push to Talk
+                </CardTitle>
+                <CardDescription className="text-center text-slate-400">
+                  {connectionStatus === "connected"
+                    ? isMobile
+                      ? "Tap and hold the microphone button to record"
+                      : "Hold the microphone button to record"
+                    : "Connect to server to start recording"}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-6">
+                <div className="flex justify-center">
+                  <Button
+                    size="lg"
+                    variant={
+                      isRecording || isPressed ? "destructive" : "default"
+                    }
+                    className={`h-24 w-24 md:h-32 md:w-32 rounded-full transition-all duration-200 ${
+                      isRecording || isPressed
+                        ? "scale-105 shadow-lg shadow-red-500/25"
+                        : "hover:scale-105 bg-blue-600 hover:bg-blue-700"
+                    } ${connectionStatus !== "connected" ? "opacity-50" : ""}`}
+                    disabled={connectionStatus !== "connected"}
+                    onMouseDown={handlePressStart}
+                    onMouseUp={handlePressEnd}
+                    onMouseLeave={handlePressEnd}
+                    onTouchStart={handlePressStart}
+                    onTouchEnd={handlePressEnd}
+                    onTouchCancel={handlePressEnd}
+                  >
+                    {isRecording ? (
+                      <Square className="h-8 w-8 md:h-12 md:w-12" />
+                    ) : (
+                      <Mic className="h-8 w-8 md:h-12 md:w-12" />
+                    )}
+                  </Button>
+                </div>
+
+                {!permissionGranted && !audioInitialized && (
+                  <div className="text-center">
+                    <Button
+                      onClick={(e) => {
+                        e.preventDefault();
+                        initializeAudio();
+                      }}
+                      className="min-h-[44px] bg-emerald-600 hover:bg-emerald-700"
+                    >
+                      <CheckCircle className="h-4 w-4 mr-2" />
+                      Grant Microphone Permission
+                    </Button>
+                  </div>
+                )}
+
+                {isRecording && (
+                  <div className="space-y-4">
+                    <div className="text-center">
+                      <div className="text-2xl md:text-3xl font-mono font-bold text-red-500">
+                        {formatTime(recordingTime)}
+                      </div>
+                      <p className="text-sm text-slate-400">Recording time</p>
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-center gap-2">
+                        <Volume2 className="h-4 w-4 text-slate-400" />
+                        <span className="text-sm text-slate-400">
+                          Audio Level
+                        </span>
+                      </div>
+                      <Progress
+                        value={Math.min(100, audioLevel)}
+                        className="w-full"
+                      />
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
             {/* File Upload Section */}
             <Card className="bg-slate-800 border-slate-700">
               <CardHeader>
@@ -1391,88 +1473,6 @@ export default function KabyleTranscriber() {
                       Connect to server to upload files
                     </AlertDescription>
                   </Alert>
-                )}
-              </CardContent>
-            </Card>
-
-            {/* Recording Controls */}
-            <Card className="bg-slate-800 border-slate-700">
-              <CardHeader>
-                <CardTitle className="text-center text-slate-100">
-                  Push to Talk
-                </CardTitle>
-                <CardDescription className="text-center text-slate-400">
-                  {connectionStatus === "connected"
-                    ? isMobile
-                      ? "Tap and hold the microphone button to record"
-                      : "Hold the microphone button to record"
-                    : "Connect to server to start recording"}
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-6">
-                <div className="flex justify-center">
-                  <Button
-                    size="lg"
-                    variant={
-                      isRecording || isPressed ? "destructive" : "default"
-                    }
-                    className={`h-24 w-24 md:h-32 md:w-32 rounded-full transition-all duration-200 ${
-                      isRecording || isPressed
-                        ? "scale-105 shadow-lg shadow-red-500/25"
-                        : "hover:scale-105 bg-blue-600 hover:bg-blue-700"
-                    } ${connectionStatus !== "connected" ? "opacity-50" : ""}`}
-                    disabled={connectionStatus !== "connected"}
-                    onMouseDown={handlePressStart}
-                    onMouseUp={handlePressEnd}
-                    onMouseLeave={handlePressEnd}
-                    onTouchStart={handlePressStart}
-                    onTouchEnd={handlePressEnd}
-                    onTouchCancel={handlePressEnd}
-                  >
-                    {isRecording ? (
-                      <Square className="h-8 w-8 md:h-12 md:w-12" />
-                    ) : (
-                      <Mic className="h-8 w-8 md:h-12 md:w-12" />
-                    )}
-                  </Button>
-                </div>
-
-                {!permissionGranted && !audioInitialized && (
-                  <div className="text-center">
-                    <Button
-                      onClick={(e) => {
-                        e.preventDefault();
-                        initializeAudio();
-                      }}
-                      className="min-h-[44px] bg-emerald-600 hover:bg-emerald-700"
-                    >
-                      <CheckCircle className="h-4 w-4 mr-2" />
-                      Grant Microphone Permission
-                    </Button>
-                  </div>
-                )}
-
-                {isRecording && (
-                  <div className="space-y-4">
-                    <div className="text-center">
-                      <div className="text-2xl md:text-3xl font-mono font-bold text-red-500">
-                        {formatTime(recordingTime)}
-                      </div>
-                      <p className="text-sm text-slate-400">Recording time</p>
-                    </div>
-                    <div className="space-y-2">
-                      <div className="flex items-center justify-center gap-2">
-                        <Volume2 className="h-4 w-4 text-slate-400" />
-                        <span className="text-sm text-slate-400">
-                          Audio Level
-                        </span>
-                      </div>
-                      <Progress
-                        value={Math.min(100, audioLevel)}
-                        className="w-full"
-                      />
-                    </div>
-                  </div>
                 )}
               </CardContent>
             </Card>

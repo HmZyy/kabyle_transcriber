@@ -1104,6 +1104,11 @@ export default function KabyleTranscriber() {
     }
   }, [addLog, handleMessage, isRecording, stopRecording, wsUrl, isMobile]);
 
+  useEffect(() => {
+    addLog("Auto-connecting to server on page load...");
+    connectWebSocket();
+  }, [connectWebSocket]);
+
   // Touch handlers
   const handlePressStart = useCallback(
     async (e: React.MouseEvent | React.TouchEvent) => {
